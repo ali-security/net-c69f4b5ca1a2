@@ -1,0 +1,100 @@
+name: seal-ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated Go test names to run instead of the full suite
+        required: false
+        default: ''
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["1.24.7", "1.25.1"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: Build
+        run: go build -v ./...
+      - name: Test
+        shell: bash
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eo pipefail
+          LOG="$RUNNER_TEMP/test.log"
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$LOG"
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$LOG" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -v ./... 2>&1 | tee "$LOG"
+          fi
+          awk '/^[[:space:]]*--- PASS/{p++} /^[[:space:]]*--- SKIP/{s++} /^[[:space:]]*--- FAIL/{f++} END{printf "Test summary: passed=%d skipped=%d failed=%d\n", p, s, f}' "$LOG"
+
+  package:
+    name: module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MOD_PATH: golang.org/x/net
+      MOD_VERSION: v0.45.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.7"
+      - name: Build module zip
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ZIPPER="$RUNNER_TEMP/zipper"
+          SRC="$RUNNER_TEMP/modsrc"
+          OUT="$RUNNER_TEMP/dist"
+          mkdir -p "$ZIPPER" "$OUT"
+          # Pack from a copy of the tree without this seal workflow (upstream ships no .github).
+          cp -a "$GITHUB_WORKSPACE" "$SRC"
+          rm -rf "$SRC/.git" "$SRC/.github"
+          cat > "$ZIPPER/main.go" <<'EOF'
+          package main
+
+          import (
+                  "log"
+                  "os"
+
+                  "golang.org/x/mod/module"
+                  "golang.org/x/mod/zip"
+          )
+
+          func main() {
+                  m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+                  f, err := os.Create(os.Args[4])
+                  if err != nil {
+                      log.Fatal(err)
+                  }
+                  defer f.Close()
+                  if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                      log.Fatal(err)
+                  }
+                  log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$ZIPPER"
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.28.0
+          go run . "$MOD_PATH" "$MOD_VERSION" "$SRC" "$OUT/$MOD_VERSION.zip"
+          unzip -l "$OUT/$MOD_VERSION.zip" | tail -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/dist/*.zip
+          if-no-files-found: error
